@@ -80,7 +80,7 @@ def single_threaded_session():
 
 ALREADY_INITIALIZED = set()
 def initialize():
-    new_variables = set(tf.all_variables()) - ALREADY_INITIALIZED
+    new_variables = set(tf.global_variables()) - ALREADY_INITIALIZED
     get_session().run(tf.initialize_variables(new_variables))
     ALREADY_INITIALIZED.update(new_variables)
 
@@ -202,7 +202,7 @@ class SetFromFlat(object):
 
 class GetFlat(object):
     def __init__(self, var_list):
-        self.op = tf.concat(0, [tf.reshape(v, [numel(v)]) for v in var_list])
+        self.op = tf.concat([tf.reshape(v, [numel(v)]) for v in var_list], 0)
     def __call__(self):
         return get_session().run(self.op)
 

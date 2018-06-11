@@ -12,7 +12,7 @@ import click
 aws_access_key_id = os.environ.get("AWS_ACCESS_KEY", None)
 aws_secret_access_key = os.environ.get("AWS_ACCESS_SECRET", None)
 REGIONS = [
-    "us-west-1",
+    "us-east-1",
 ]
 
 def highlight(x):

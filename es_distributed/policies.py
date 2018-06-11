@@ -1,11 +1,37 @@
 import logging
 import pickle
+import os
+import subprocess
+import retro
+import gym_remote.client as grc
+import gym_remote.exceptions as gre
 
 import h5py
 import numpy as np
 import tensorflow as tf
 
 from . import tf_util as U
+
+
+import random
+import copy
+
+#ppo requirements
+from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
+import baselines.ppo2.ppo2 as ppo2
+import baselines.ppo2.policies as ppo2_policies
+from baselines.a2c.utils import conv, fc, conv_to_fc, batch_to_seq, seq_to_batch, lstm, lnlstm
+from baselines.common.distributions import make_pdtype
+from baselines import logger
+
+from sonic_util_train import AllowBacktracking, SonicDiscretizer, RewardScaler, FrameStack, WarpFrame, make_env
+import traceback
+import threading
+import joblib
+import time
+import shutil
+import csv
+
 
 logger = logging.getLogger(__name__)
 
@@ -14,10 +40,14 @@ class Policy:
     def __init__(self, *args, **kwargs):
         self.args, self.kwargs = args, kwargs
         self.scope = self._initialize(*args, **kwargs)
-        self.all_variables = tf.get_collection(tf.GraphKeys.VARIABLES, self.scope.name)
+        #print('scope is {}'.format(self.scope))
+        self.all_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, self.scope.name)
+        #print('all variables', self.all_variables)
 
         self.trainable_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, self.scope.name)
+        print('trainable variables', self.trainable_variables)
         self.num_params = sum(int(np.prod(v.get_shape().as_list())) for v in self.trainable_variables)
+        print('num_params', self.num_params)
         self._setfromflat = U.SetFromFlat(self.trainable_variables)
         self._getflat = U.GetFlat(self.trainable_variables)
 
@@ -67,27 +97,36 @@ class Policy:
         If random_stream is provided, the rollout will take noisy actions with noise drawn from that stream.
         Otherwise, no action noise will be added.
         """
-        env_timestep_limit = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
-        timestep_limit = env_timestep_limit if timestep_limit is None else min(timestep_limit, env_timestep_limit)
+        if timestep_limit is None:
+            timestep_limit = 4500
         rews = []
         t = 0
         if save_obs:
             obs = []
-        ob = env.reset()
-        for _ in range(timestep_limit):
-            ac = self.act(ob[None], random_stream=random_stream)[0]
-            if save_obs:
-                obs.append(ob)
-            ob, rew, done, _ = env.step(ac)
-            rews.append(rew)
-            t += 1
-            if render:
-                env.render()
-            if done:
-                break
+        #ob = env.reset()
+        for game, state in self.get_training_envs():
+            self.env.close()
+            print('launching {} {}'.format(game, state))
+            self.env = self.launch_env(game, state)
+            ob = self.env.reset()
+            for _ in range(timestep_limit):
+                embedding = self.session.run([self.output_layer], {self.model.X: ob[None]})[0].reshape(512,)
+                ac = self.act([embedding], random_stream=random_stream)
+                if save_obs:
+                    #print('appending embedding', embedding.shape)
+                    #obs.append(ob)
+                    obs.append(embedding)
+                ob, rew, done, _ = self.env.step(ac)
+                rews.append(rew)
+                t += 1
+                if render:
+                    self.env.render()
+                if done:
+                    break
         rews = np.array(rews, dtype=np.float32)
         if save_obs:
             return rews, t, np.array(obs)
+        print('completed rollout')
         return rews, t
 
     def act(self, ob, random_stream=None):
@@ -113,91 +152,106 @@ def bins(x, dim, num_bins, name):
     return tf.argmax(scores_nab, 2)  # 0 ... num_bins-1
 
 
-class MujocoPolicy(Policy):
-    def _initialize(self, ob_space, ac_space, ac_bins, ac_noise_std, nonlin_type, hidden_dims, connection_type):
-        self.ac_space = ac_space
-        self.ac_bins = ac_bins
+class SonicPolicy(Policy):
+    def _initialize(self, ac_noise_std):
+        import numpy as np
+        BUTTONS = ["B", "A", "MODE", "START", "UP", "DOWN", "LEFT", "RIGHT", "C", "Y", "X", "Z"]
+        COMBOS = [['LEFT'], ['RIGHT'], ['LEFT', 'DOWN'], ['RIGHT', 'DOWN'], ['DOWN'],
+                   ['DOWN', 'B'], ['B']]
+        valid_actions = []
+        for action in COMBOS:
+            arr = np.array([False] * 12)
+            for button in action:
+                arr[BUTTONS.index(button)] = True
+            valid_actions.append(arr)
+        self.ACTIONS = valid_actions
+
+        self.session = tf.get_default_session()
+
+        #just the first one in the list
+        self.env = self.launch_env('SonicTheHedgehog-Genesis', 'SpringYardZone.Act1')
+        self.model = ppo2_policies.CnnPolicy(
+            self.session,
+            self.env.observation_space,
+            self.env.action_space,
+            1,
+            1)
+        self.a0 = self.model.pd.sample()
+        #params = tf.trainable_variables()
+        self.output_layer = tf.get_default_graph().get_tensor_by_name('model/Relu_3:0')
+        
+        self.input_shape = (512,)
         self.ac_noise_std = ac_noise_std
-        self.hidden_dims = hidden_dims
-        self.connection_type = connection_type
-
-        assert len(ob_space.shape) == len(self.ac_space.shape) == 1
-        assert np.all(np.isfinite(self.ac_space.low)) and np.all(np.isfinite(self.ac_space.high)), \
-            'Action bounds required'
-
-        self.nonlin = {'tanh': tf.tanh, 'relu': tf.nn.relu, 'lrelu': U.lrelu, 'elu': tf.nn.elu}[nonlin_type]
 
         with tf.variable_scope(type(self).__name__) as scope:
             # Observation normalization
             ob_mean = tf.get_variable(
-                'ob_mean', ob_space.shape, tf.float32, tf.constant_initializer(np.nan), trainable=False)
+                'ob_mean', self.input_shape, tf.float32, tf.constant_initializer(0.1), trainable=False)
             ob_std = tf.get_variable(
-                'ob_std', ob_space.shape, tf.float32, tf.constant_initializer(np.nan), trainable=False)
-            in_mean = tf.placeholder(tf.float32, ob_space.shape)
-            in_std = tf.placeholder(tf.float32, ob_space.shape)
+                'ob_std', self.input_shape, tf.float32, tf.constant_initializer(0.001), trainable=False)
+            in_mean = tf.placeholder(tf.float32, self.input_shape)
+            in_std = tf.placeholder(tf.float32, self.input_shape)
             self._set_ob_mean_std = U.function([in_mean, in_std], [], updates=[
                 tf.assign(ob_mean, in_mean),
                 tf.assign(ob_std, in_std),
             ])
 
             # Policy network
-            o = tf.placeholder(tf.float32, [None] + list(ob_space.shape))
-            a = self._make_net(tf.clip_by_value((o - ob_mean) / ob_std, -5.0, 5.0))
+            o = tf.placeholder(tf.float32, [None] + list(self.input_shape))
+            #o = self.output_layer
+
+            # normalize
+            a = tf.clip_by_value((o - ob_mean) / ob_std, -5.0, 5.0)
+            a = U.dense(a, 7, 'out', U.normc_initializer(0.01))
+
             self._act = U.function([o], a)
         return scope
 
-    def _make_net(self, o):
-        # Process observation
-        if self.connection_type == 'ff':
-            x = o
-            for ilayer, hd in enumerate(self.hidden_dims):
-                x = self.nonlin(U.dense(x, hd, 'l{}'.format(ilayer), U.normc_initializer(1.0)))
-        else:
-            raise NotImplementedError(self.connection_type)
+    def get_training_envs(self):
+        envs = []
+        with open('./sonic-train.csv', 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            for row in reader:
+                game, state = row
+                if game == 'game':
+                    continue
+                else:
+                    envs.append(row)
+        return envs
 
-        # Map to action
-        adim, ahigh, alow = self.ac_space.shape[0], self.ac_space.high, self.ac_space.low
-        assert isinstance(self.ac_bins, str)
-        ac_bin_mode, ac_bin_arg = self.ac_bins.split(':')
+    def launch_env(self, game, state):
+        #game, state = random.choice(env_data)
+        # retro-contest-remote run -s tmp/sock -m monitor -d SonicTheHedgehog-Genesis GreenHillZone.Act1
+        
+        #base_dir = './remotes/'
+        #if os.path.exists(base_dir):
+        #    shutil.rmtree(base_dir)
+        #os.makedirs(base_dir, exist_ok=True)
+        #os.makedirs(base_dir + state, exist_ok=True)
+        #socket_dir = base_dir + "{}/sock".format(state)
+        #os.makedirs(socket_dir, exist_ok=True)
+        #monitor_dir = base_dir + "{}/monitor".format(state)
+        #os.makedirs(monitor_dir, exist_ok=True)
+        #subprocess.Popen(["retro-contest-remote", "run", "-s", socket_dir, '-m', monitor_dir, '-d', game, state], stdout=subprocess.PIPE)
+        #env = grc.RemoteEnv(socket_dir)
+        env = retro.make(game, state)
 
-        if ac_bin_mode == 'uniform':
-            # Uniformly spaced bins, from ac_space.low to ac_space.high
-            num_ac_bins = int(ac_bin_arg)
-            aidx_na = bins(x, adim, num_ac_bins, 'out')  # 0 ... num_ac_bins-1
-            ac_range_1a = (ahigh - alow)[None, :]
-            a = 1. / (num_ac_bins - 1.) * tf.to_float(aidx_na) * ac_range_1a + alow[None, :]
+        env = SonicDiscretizer(env)
+        env = RewardScaler(env)
+        env = WarpFrame(env)
+        env = FrameStack(env, 4)
 
-        elif ac_bin_mode == 'custom':
-            # Custom bins specified as a list of values from -1 to 1
-            # The bins are rescaled to ac_space.low to ac_space.high
-            acvals_k = np.array(list(map(float, ac_bin_arg.split(','))), dtype=np.float32)
-            logger.info('Custom action values: ' + ' '.join('{:.3f}'.format(x) for x in acvals_k))
-            assert acvals_k.ndim == 1 and acvals_k[0] == -1 and acvals_k[-1] == 1
-            acvals_ak = (
-                (ahigh - alow)[:, None] / (acvals_k[-1] - acvals_k[0]) * (acvals_k - acvals_k[0])[None, :]
-                + alow[:, None]
-            )
-
-            aidx_na = bins(x, adim, len(acvals_k), 'out')  # values in [0, k-1]
-            a = tf.gather_nd(
-                acvals_ak,
-                tf.concat(2, [
-                    tf.tile(np.arange(adim)[None, :, None], [tf.shape(aidx_na)[0], 1, 1]),
-                    tf.expand_dims(aidx_na, -1)
-                ])  # (n,a,2)
-            )  # (n,a)
-        elif ac_bin_mode == 'continuous':
-            a = U.dense(x, adim, 'out', U.normc_initializer(0.01))
-        else:
-            raise NotImplementedError(ac_bin_mode)
-
-        return a
+        return env
 
     def act(self, ob, random_stream=None):
+        #embedding = self.session.run([self.output_layer], {self.model.X: ob})[0].reshape(512,)
         a = self._act(ob)
         if random_stream is not None and self.ac_noise_std != 0:
             a += random_stream.randn(*a.shape) * self.ac_noise_std
-        return a
+        action = np.argmax(a[0])
+        env_action = self.ACTIONS[action]
+        #print('ACTIONS, action, env_action', self.ACTIONS, action, env_action)
+        return env_action
 
     @property
     def needs_ob_stat(self):
@@ -208,6 +262,13 @@ class MujocoPolicy(Policy):
         return False
 
     def set_ob_stat(self, ob_mean, ob_std):
+        #if ob_mean.shape != (512,):
+        #    print('ob_mean', ob_mean)
+        #    print('ob_std', ob_std)
+        #    pass
+        if ob_mean.shape != (512,):
+            print('bad ob_mean_shape', ob_mean.shape)
+            return
         self._set_ob_mean_std(ob_mean, ob_std)
 
     def initialize_from(self, filename, ob_stat=None):

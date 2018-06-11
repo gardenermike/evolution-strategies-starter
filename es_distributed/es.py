@@ -29,9 +29,12 @@ class RunningStat(object):
         self.count = eps
 
     def increment(self, s, ssq, c):
-        self.sum += s
-        self.sumsq += ssq
-        self.count += c
+        try:
+            self.sum += s
+            self.sumsq += ssq
+            self.count += c
+        except ValueError as err:
+            print(err)
 
     @property
     def mean(self):
@@ -112,16 +115,18 @@ def batched_weighted_sum(weights, vecs, batch_size):
         num_items_summed += len(batch_weights)
     return total, num_items_summed
 
-
 def setup(exp, single_threaded):
-    import gym
-    gym.undo_logger_setup()
+    #import gym
+    #gym.undo_logger_setup()
+
     from . import policies, tf_util
 
     config = Config(**exp['config'])
-    env = gym.make(exp['env_id'])
+    #env = gym.make(exp['env_id'])
+    #env = make_env()
     sess = make_session(single_threaded=single_threaded)
-    policy = getattr(policies, exp['policy']['type'])(env.observation_space, env.action_space, **exp['policy']['args'])
+    policy = getattr(policies, exp['policy']['type'])(**exp['policy']['args'])
+    env = policy.env
     tf_util.initialize()
 
     return config, env, sess, policy
