@@ -1,15 +1,15 @@
 {
   "variables": {
-    "aws_access_key": "",
-    "aws_secret_key": ""
+    "aws_access_key": "03CD223WF96D9KNZ1DG2",
+    "aws_secret_key": "cSoNyADG8/zviXOrCN4hEiTYU+MUrxjYcpWngj7i"
   },
   "builders": [
     {
       "type": "amazon-ebs",
       "access_key": "{{user `aws_access_key`}}",
       "secret_key": "{{user `aws_secret_key`}}",
-      "region": "us-west-1",
-      "source_ami": "ami-d8bdebb8",
+      "region": "us-east-1",
+      "source_ami": "ami-a4dc46db",
       "instance_type": "t2.micro",
       "ssh_username": "ubuntu",
       "ami_name": "es-dist-{{isotime \"2006-01-02-03-04-05\"}}",
@@ -28,18 +28,7 @@
         }
       ],
       "ami_regions": [
-        "us-west-1",
-        "us-west-2",
-        "us-east-1",
-        "us-east-2",
-        "eu-west-1",
-        "eu-central-1",
-        "ap-northeast-1",
-        "ap-northeast-2",
-        "ap-southeast-1",
-        "ap-southeast-2",
-        "ap-south-1",
-        "sa-east-1"
+        "us-east-1"
       ]
     }
   ],

@@ -5,7 +5,7 @@ import os
 import click
 
 AMI_MAP = {
-    "us-west-1": "FILL IN YOUR AMI HERE",
+    "us-east-1": "ami-5081ed2f",
 }
 
 
@@ -76,7 +76,7 @@ cd ~
 wget --quiet "{code_url}" -O code.tar.gz
 tar xvaf code.tar.gz
 rm code.tar.gz
-cd es-distributed
+cd evolution-strategies-starter
 {cmd}
 EOF
 """.format(code_url=code_url, cmd=cmd)
@@ -128,7 +128,7 @@ set -x
 echo 'save ""' >> /etc/redis/redis.conf
 
 # Make redis use a unix domain socket and disable TCP sockets
-sed -ie "s/port 6379/port 0/" /etc/redis/redis.conf
+sed -ie "s/port 6380/port 0/" /etc/redis/redis.conf
 echo "unixsocket /var/run/redis/redis.sock" >> /etc/redis/redis.conf
 echo "unixsocketperm 777" >> /etc/redis/redis.conf
 mkdir -p /var/run/redis
